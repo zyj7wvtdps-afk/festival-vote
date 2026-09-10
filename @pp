@@ -1,0 +1,2395 @@
+(() => {
+  'use strict';
+
+  const STORAGE_KEY = 'festival-race-state-v1';
+  const VOTER_KEY = 'festival-race-voter-id-v1';
+  const THEME_KEY = 'festival-race-theme-v1';
+  const REMOTE_RACE_ID = 'current';
+
+  const initialState = () => ({
+    title: '文化祭記念・人気投票',
+    status: 'open', // open | closed | revealed
+    revealed: false,
+    winnerId: null,
+    horses: [
+      { id: 'horse-1', name: 'グリーンリーフ' },
+      { id: 'horse-2', name: 'サクラフェス' },
+      { id: 'horse-3', name: 'ハッピーギャロップ' },
+      { id: 'horse-4', name: 'ミライスター' },
+      { id: 'horse-5', name: 'ホワイトキャンバス' },
+      { id: 'horse-6', name: 'キラキラダッシュ' },
+    ],
+    votes: {},
+    updatedAt: Date.now(),
+  });
+
+  const remote = {
+    configured: Boolean(
+      window.firebase &&
+      window.FIREBASE_CONFIG?.projectId
+    ),
+    fallback: false,
+    authReady: false,
+    user: null,
+    admin: false,
+    auth: null,
+    db: null,
+    raceRef: null,
+    votesRef: null,
+    stopRace: null,
+    stopVotes: null,
+    error: '',
+    signingIn: false,
+  };
+
+  let state = loadState();
+  let toastTimer;
+  let adminToastTimer;
+  let broadcast;
+
+  const $ = (selector, parent = document) =>
+    parent.querySelector(selector);
+
+  const $$ = (selector, parent = document) =>
+    [...parent.querySelectorAll(selector)];
+
+  function safeStorageGet(key) {
+    try {
+      return window.localStorage.getItem(key);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function safeStorageSet(key, value) {
+    try {
+      window.localStorage.setItem(key, value);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function makeId() {
+    if (window.crypto?.randomUUID) {
+      return window.crypto.randomUUID();
+    }
+
+    return `voter-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2)}`;
+  }
+
+  function getVoterId() {
+    let id = safeStorageGet(VOTER_KEY);
+
+    if (!id) {
+      id = makeId();
+      safeStorageSet(VOTER_KEY, id);
+    }
+
+    return id;
+  }
+
+  const voterId = getVoterId();
+
+  function toMillis(value) {
+    if (
+      typeof value === 'number' &&
+      Number.isFinite(value)
+    ) {
+      return value;
+    }
+
+    if (
+      value &&
+      typeof value.toMillis === 'function'
+    ) {
+      return value.toMillis();
+    }
+
+    if (
+      value &&
+      Number.isFinite(value.seconds)
+    ) {
+      return value.seconds * 1000;
+    }
+
+    return Date.now();
+  }
+
+  function normalizeState(raw) {
+    const fallback = initialState();
+
+    if (!raw || typeof raw !== 'object') {
+      return fallback;
+    }
+
+    const horses =
+      Array.isArray(raw.horses) &&
+      raw.horses.length >= 1
+        ? raw.horses.map((horse, index) => ({
+            id: String(
+              horse.id ||
+              `horse-${index + 1}`
+            ),
+            name: String(
+              horse.name ||
+              `出走馬 ${index + 1}`
+            ).slice(0, 40),
+          }))
+        : fallback.horses;
+
+    const votes =
+      raw.votes &&
+      typeof raw.votes === 'object'
+        ? raw.votes
+        : {};
+
+    const status = [
+      'open',
+      'closed',
+      'revealed',
+    ].includes(raw.status)
+      ? raw.status
+      : 'open';
+
+    return {
+      title: String(
+        raw.title ||
+        fallback.title
+      ).slice(0, 40),
+
+      status,
+
+      revealed:
+        status === 'revealed' ||
+        raw.revealed === true,
+
+      winnerId:
+        raw.winnerId
+          ? String(raw.winnerId)
+          : null,
+
+      horses,
+
+      votes,
+
+      updatedAt: toMillis(
+        raw.updatedAt
+      ),
+    };
+  }
+
+  function loadState() {
+    const saved =
+      safeStorageGet(STORAGE_KEY);
+
+    if (!saved) {
+      return initialState();
+    }
+
+    try {
+      return normalizeState(
+        JSON.parse(saved)
+      );
+    } catch (_) {
+      return initialState();
+    }
+  }
+
+  function currentVoterKey() {
+    return (
+      remote.user?.uid ||
+      voterId
+    );
+  }
+
+  function remoteActive() {
+    return (
+      remote.configured &&
+      !remote.fallback &&
+      remote.authReady &&
+      Boolean(remote.user)
+    );
+  }
+
+  function syncLocalSnapshot(
+    nextState,
+    notifyOtherTabs = false
+  ) {
+    state =
+      normalizeState(nextState);
+
+    safeStorageSet(
+      STORAGE_KEY,
+      JSON.stringify(state)
+    );
+
+    if (notifyOtherTabs) {
+      try {
+        broadcast?.postMessage({
+          type: 'state-updated',
+          state,
+        });
+      } catch (_) {
+        // optional
+      }
+    }
+
+    renderAll();
+  }
+
+  function saveLocalState(
+    nextState,
+    message = ''
+  ) {
+    syncLocalSnapshot(
+      {
+        ...nextState,
+        updatedAt: Date.now(),
+      },
+      true
+    );
+
+    if (message) {
+      showToast(message);
+    }
+  }
+
+  function escapeHTML(value) {
+    return String(value)
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#039;');
+  }
+
+  function getCounts() {
+    const counts =
+      Object.fromEntries(
+        state.horses.map(
+          (horse) => [horse.id, 0]
+        )
+      );
+
+    Object.values(
+      state.votes
+    ).forEach((horseId) => {
+      if (
+        Object.prototype.hasOwnProperty.call(
+          counts,
+          horseId
+        )
+      ) {
+        counts[horseId] += 1;
+      }
+    });
+
+    return counts;
+  }
+
+  function getRanking() {
+    const counts =
+      getCounts();
+
+    return state.horses
+      .map((horse, index) => ({
+        ...horse,
+        originalIndex: index,
+        count:
+          counts[horse.id] || 0,
+      }))
+      .sort(
+        (a, b) =>
+          b.count - a.count ||
+          a.originalIndex -
+            b.originalIndex
+      );
+  }
+
+  function getHorse(horseId) {
+    return state.horses.find(
+      (horse) =>
+        horse.id === horseId
+    );
+  }
+
+  function totalVotes() {
+    return Object.values(
+      getCounts()
+    ).reduce(
+      (sum, count) =>
+        sum + count,
+      0
+    );
+  }
+
+  function statusLabel() {
+    if (
+      state.status === 'revealed'
+    ) {
+      return [
+        '結果発表済み',
+        'status-revealed',
+      ];
+    }
+
+    if (
+      state.status === 'closed'
+    ) {
+      return [
+        '投票受付終了',
+        'status-closed',
+      ];
+    }
+
+    return [
+      '投票受付中',
+      'status-open',
+    ];
+  }
+
+  function formatUpdated() {
+    if (!state.updatedAt) {
+      return 'たった今更新';
+    }
+
+    const time =
+      new Date(
+        state.updatedAt
+      ).toLocaleTimeString(
+        'ja-JP',
+        {
+          hour: '2-digit',
+          minute: '2-digit',
+        }
+      );
+
+    return `${time}に更新`;
+  }
+
+  function renderRaceMeta() {
+    const [
+      label,
+      className,
+    ] = statusLabel();
+
+    const status =
+      $('#race-status');
+
+    if (status) {
+      status.className =
+        `status-pill ${className}`;
+
+      status.innerHTML =
+        `<span class="status-dot"></span>${label}`;
+    }
+
+    const raceTitle =
+      $('#race-title');
+
+    if (raceTitle) {
+      raceTitle.textContent =
+        state.title;
+    }
+
+    const subtitle =
+      $('#race-subtitle');
+
+    if (subtitle) {
+      subtitle.textContent =
+        state.status === 'open'
+          ? 'みんなの人気投票を受付中'
+          : state.status === 'revealed'
+            ? '投票結果が発表されました'
+            : '投票の受付は終了しました';
+    }
+  }
+
+  function renderNotice() {
+    const notices = [];
+
+    if (
+      state.status === 'revealed'
+    ) {
+      notices.push(`
+        <div class="notice success">
+          <span aria-hidden="true">🏆</span>
+          <span>
+            結果が発表されました。
+            「みんなの予想」から結果を確認できます。
+          </span>
+        </div>
+      `);
+    } else if (
+      state.status === 'closed'
+    ) {
+      notices.push(`
+        <div class="notice warning">
+          <span aria-hidden="true">⏸</span>
+          <span>
+            ただいま投票受付を終了しています。
+            結果発表をお楽しみに！
+          </span>
+        </div>
+      `);
+    }
+
+    if (
+      !remote.configured ||
+      remote.fallback
+    ) {
+      notices.push(`
+        <div class="notice warning">
+          <span aria-hidden="true">!</span>
+          <span>
+            現在サーバーに接続できないため、
+            投票を受け付けていません。
+          </span>
+        </div>
+      `);
+    } else if (
+      remote.error
+    ) {
+      notices.push(`
+        <div class="notice warning">
+          <span aria-hidden="true">!</span>
+          <span>
+            ${escapeHTML(remote.error)}
+          </span>
+        </div>
+      `);
+    }
+
+    const area =
+      $('#notice-area');
+
+    if (area) {
+      area.innerHTML =
+        notices.join('');
+    }
+  }
+
+  function renderHorseList() {
+    const list =
+      $('#horse-list');
+
+    if (!list) return;
+
+    const count =
+      $('#horse-count');
+
+    if (count) {
+      count.textContent =
+        state.horses.length;
+    }
+
+    const myVote =
+      currentVoterKey()
+        ? state.votes[
+            currentVoterKey()
+          ]
+        : null;
+
+    const firebaseUnavailable =
+      !remote.configured ||
+      remote.fallback;
+
+    const waitingForFirebase =
+      remote.configured &&
+      !remote.fallback &&
+      !remote.authReady;
+
+    const disabled =
+      firebaseUnavailable ||
+      waitingForFirebase ||
+      state.status !== 'open' ||
+      Boolean(myVote);
+
+    list.innerHTML =
+      state.horses
+        .map(
+          (horse, index) => `
+            <div class="horse-option">
+              <input
+                id="pick-${escapeHTML(
+                  horse.id
+                )}"
+                name="horse"
+                value="${escapeHTML(
+                  horse.id
+                )}"
+                type="radio"
+                ${
+                  myVote === horse.id
+                    ? 'checked'
+                    : ''
+                }
+                ${
+                  disabled
+                    ? 'disabled'
+                    : ''
+                }
+              />
+
+              <label
+                class="horse-label"
+                for="pick-${escapeHTML(
+                  horse.id
+                )}"
+              >
+                <span class="horse-number">
+                  ${String(
+                    index + 1
+                  ).padStart(2, '0')}
+                </span>
+
+                <span>
+                  <span class="horse-name">
+                    ${escapeHTML(
+                      horse.name
+                    )}
+                  </span>
+
+                  <small class="horse-sub">
+                    人気投票
+                  </small>
+                </span>
+
+                <span
+                  class="checkmark"
+                  aria-hidden="true"
+                ></span>
+              </label>
+            </div>
+          `
+        )
+        .join('');
+
+    const voteButton =
+      $('#vote-button');
+
+    if (!voteButton) return;
+
+    voteButton.disabled =
+      disabled;
+
+    if (
+      firebaseUnavailable
+    ) {
+      voteButton.innerHTML =
+        '<span>現在利用できません</span>';
+    } else if (
+      waitingForFirebase
+    ) {
+      voteButton.innerHTML =
+        '<span>接続中…</span>';
+    } else if (
+      state.status === 'open' &&
+      !myVote
+    ) {
+      voteButton.innerHTML =
+        '<span>投票する</span>' +
+        '<span class="button-arrow" aria-hidden="true">→</span>';
+    } else {
+      voteButton.innerHTML =
+        '<span>投票受付終了</span>';
+    }
+
+    voteButton.style.opacity =
+      disabled ? '.55' : '1';
+  }
+
+  function renderVotedPanel() {
+    const myVote =
+      state.votes[
+        currentVoterKey()
+      ];
+
+    const votedPanel =
+      $('#voted-panel');
+
+    const votePanel =
+      $('#vote-panel');
+
+    if (!votedPanel || !votePanel) {
+      return;
+    }
+
+    if (!myVote) {
+      votedPanel.classList.add(
+        'hidden'
+      );
+
+      votePanel.classList.remove(
+        'hidden'
+      );
+
+      return;
+    }
+
+    const horse =
+      getHorse(myVote);
+
+    $('#my-vote-name').textContent =
+      horse?.name ||
+      '選択した候補';
+
+    const message =
+      $('#voted-result-message');
+
+    if (
+      state.status === 'revealed' &&
+      state.winnerId
+    ) {
+      const winner =
+        getHorse(
+          state.winnerId
+        );
+
+      const hit =
+        myVote ===
+        state.winnerId;
+
+      message.innerHTML =
+        hit
+          ? `
+            <div class="result-message hit">
+              🎉 あなたの予想が的中！
+            </div>
+          `
+          : `
+            <div class="result-message waiting">
+              結果発表：
+              1位は
+              「${escapeHTML(
+                winner?.name || ''
+              )}」
+              でした。
+            </div>
+          `;
+    } else {
+      message.innerHTML = `
+        <div class="result-message waiting">
+          結果発表まで、
+          みんなの人気ランキングを
+          見ながらお待ちください。
+        </div>
+      `;
+    }
+
+    votePanel.classList.add(
+      'hidden'
+    );
+
+    votedPanel.classList.remove(
+      'hidden'
+    );
+  }
+
+  function renderRanking() {
+    const ranking =
+      getRanking();
+
+    const total =
+      totalVotes();
+
+    const max =
+      Math.max(
+        1,
+        ...ranking.map(
+          (horse) =>
+            horse.count
+        )
+      );
+
+    const totalVotesElement =
+      $('#total-votes');
+
+    if (totalVotesElement) {
+      totalVotesElement.textContent =
+        total;
+    }
+
+    const topHorse =
+      $('#top-horse');
+
+    if (topHorse) {
+      topHorse.textContent =
+        total
+          ? ranking[0]?.name ||
+            '—'
+          : '—';
+    }
+
+    const updated =
+      $('#updated-label');
+
+    if (updated) {
+      updated.textContent =
+        formatUpdated();
+    }
+
+    const list =
+      $('#ranking-list');
+
+    if (!list) return;
+
+    list.innerHTML =
+      ranking
+        .map(
+          (horse, index) => `
+            <div class="ranking-row">
+              <span class="rank-number">
+                ${index + 1}
+              </span>
+
+              <span class="ranking-name">
+                ${escapeHTML(
+                  horse.name
+                )}
+
+                <small>
+                  ${
+                    index === 0 &&
+                    total
+                      ? '現在の人気No.1'
+                      : '人気投票'
+                  }
+                </small>
+              </span>
+
+              <span class="bar-track">
+                <span
+                  class="bar-fill"
+                  style="width: ${
+                    horse.count
+                      ? Math.max(
+                          7,
+                          (horse.count /
+                            max) *
+                            100
+                        )
+                      : 0
+                  }%"
+                ></span>
+              </span>
+
+              <span class="vote-count">
+                ${horse.count}
+                <small>票</small>
+              </span>
+            </div>
+          `
+        )
+        .join('');
+  }
+
+  function renderResultBox() {
+    const box =
+      $('#result-box');
+
+    if (!box) return;
+
+    if (
+      state.status === 'revealed' &&
+      state.winnerId
+    ) {
+      const winner =
+        getHorse(
+          state.winnerId
+        );
+
+      const myVote =
+        state.votes[
+          currentVoterKey()
+        ];
+
+      const hit =
+        myVote ===
+        state.winnerId;
+
+      box.innerHTML = `
+        <p class="section-kicker">
+          FINAL RESULT
+        </p>
+
+        <h2>
+          結果発表！
+        </h2>
+
+        <p>
+          みんなの投票で選ばれた
+          1位はこちらです。
+        </p>
+
+        <div class="result-winner">
+          <span
+            class="result-winner-icon"
+            aria-hidden="true"
+          >
+            🏆
+          </span>
+
+          <span>
+            <strong>
+              ${escapeHTML(
+                winner?.name ||
+                '—'
+              )}
+            </strong>
+
+            <small>
+              1位 / WINNER
+            </small>
+          </span>
+        </div>
+
+        ${
+          myVote
+            ? `
+              <div class="hit-callout">
+                ${
+                  hit
+                    ? '🎉 あなたの予想が的中！'
+                    : '次回は1位を当ててみよう！'
+                }
+              </div>
+            `
+            : ''
+        }
+      `;
+    } else {
+      box.innerHTML = `
+        <p class="section-kicker">
+          FINAL RESULT
+        </p>
+
+        <h2>
+          結果発表を待とう
+        </h2>
+
+        <p>
+          スタッフが結果を発表するまで、
+          1位は秘密です。
+          現在の人気ランキングを
+          確認できます。
+        </p>
+
+        <div class="result-winner">
+          <span
+            class="result-winner-icon"
+            aria-hidden="true"
+          >
+            🎫
+          </span>
+
+          <span>
+            <strong>
+              Coming soon…
+            </strong>
+
+            <small>
+              RESULT NOT ANNOUNCED
+            </small>
+          </span>
+        </div>
+      `;
+    }
+  }
+
+  function renderAdmin() {
+    const adminLogin =
+      $('#admin-login');
+
+    const adminDashboard =
+      $('#admin-dashboard');
+
+    if (
+      !adminLogin ||
+      !adminDashboard
+    ) {
+      return;
+    }
+
+    /*
+     * 管理者はFirebase Authentication
+     * ＋ admins/{UID} のみ。
+     *
+     * ローカルデモ認証は使用しません。
+     */
+    const loggedIn =
+      remote.configured &&
+      !remote.fallback &&
+      remote.admin;
+
+    adminLogin.classList.toggle(
+      'hidden',
+      loggedIn
+    );
+
+    adminDashboard.classList.toggle(
+      'hidden',
+      !loggedIn
+    );
+
+    if (!loggedIn) {
+      return;
+    }
+
+    $('#setting-title').value =
+      state.title;
+
+    $('#admin-horse-count')
+      .textContent =
+      state.horses.length;
+
+    $('#admin-total-votes')
+      .textContent =
+      totalVotes();
+
+    const ranking =
+      getRanking();
+
+    $('#admin-top-horse')
+      .textContent =
+      totalVotes()
+        ? ranking[0]?.name || '—'
+        : '—';
+
+    $('#admin-status-text')
+      .textContent =
+      state.status === 'open'
+        ? '受付中'
+        : state.status === 'closed'
+          ? '受付終了'
+          : '結果発表済み';
+
+    const isOpen =
+      state.status === 'open';
+
+    const toggle =
+      $('#toggle-open-button');
+
+    toggle.setAttribute(
+      'aria-checked',
+      String(isOpen)
+    );
+
+    toggle.querySelector('b')
+      .textContent =
+      isOpen
+        ? '受付中'
+        : '受付終了';
+
+    $('#admin-horse-list')
+      .innerHTML =
+      state.horses
+        .map(
+          (horse, index) => `
+            <div class="admin-horse-row">
+              <span>
+                ${index + 1}
+              </span>
+
+              <input
+                type="text"
+                maxlength="40"
+                value="${escapeHTML(
+                  horse.name
+                )}"
+                data-horse-name="${escapeHTML(
+                  horse.id
+                )}"
+                aria-label="${escapeHTML(
+                  horse.name
+                )}の名前"
+              />
+
+              <div class="order-actions">
+                <button
+                  type="button"
+                  data-move="up"
+                  data-horse-id="${escapeHTML(
+                    horse.id
+                  )}"
+                  ${
+                    index === 0
+                      ? 'disabled'
+                      : ''
+                  }
+                  aria-label="上へ"
+                >
+                  ↑
+                </button>
+
+                <button
+                  type="button"
+                  data-move="down"
+                  data-horse-id="${escapeHTML(
+                    horse.id
+                  )}"
+                  ${
+                    index ===
+                    state.horses.length - 1
+                      ? 'disabled'
+                      : ''
+                  }
+                  aria-label="下へ"
+                >
+                  ↓
+                </button>
+              </div>
+            </div>
+          `
+        )
+        .join('');
+
+    const winnerSelect =
+      $('#winner-select');
+
+    winnerSelect.innerHTML =
+      state.horses
+        .map(
+          (horse) => `
+            <option
+              value="${escapeHTML(
+                horse.id
+              )}"
+              ${
+                horse.id ===
+                state.winnerId
+                  ? 'selected'
+                  : ''
+              }
+            >
+              ${escapeHTML(
+                horse.name
+              )}
+            </option>
+          `
+        )
+        .join('');
+
+    $('#current-winner')
+      .textContent =
+      state.winnerId &&
+      getHorse(
+        state.winnerId
+      )
+        ? `設定中：${
+            getHorse(
+              state.winnerId
+            ).name
+          }`
+        : 'まだ結果は発表されていません';
+  }
+
+  function renderAll() {
+    renderRaceMeta();
+    renderNotice();
+    renderHorseList();
+    renderVotedPanel();
+    renderRanking();
+    renderResultBox();
+    renderAdmin();
+  }
+
+  function navigate(
+    viewName,
+    updateHash = true
+  ) {
+    const view =
+      [
+        'vote',
+        'results',
+        'admin',
+      ].includes(viewName)
+        ? viewName
+        : 'vote';
+
+    $$('.view').forEach(
+      (section) => {
+        section.classList.toggle(
+          'active-view',
+          section.id ===
+            `view-${view}`
+        );
+      }
+    );
+
+    $$('.nav-link').forEach(
+      (button) => {
+        button.classList.toggle(
+          'active',
+          button.dataset.nav ===
+            view
+        );
+      }
+    );
+
+    if (
+      updateHash &&
+      window.location.hash !==
+        `#${view}`
+    ) {
+      history.replaceState(
+        null,
+        '',
+        `#${view}`
+      );
+    }
+
+    window.scrollTo({
+      top: 0,
+      behavior: 'smooth',
+    });
+  }
+
+  function showToast(message) {
+    const toast =
+      $('#toast');
+
+    if (!toast) return;
+
+    toast.textContent =
+      message;
+
+    toast.classList.add(
+      'show'
+    );
+
+    clearTimeout(
+      toastTimer
+    );
+
+    toastTimer =
+      setTimeout(
+        () =>
+          toast.classList.remove(
+            'show'
+          ),
+        2800
+      );
+  }
+
+  function showAdminToast(
+    message,
+    kind = 'success'
+  ) {
+    const area =
+      $('#admin-toast');
+
+    if (!area) return;
+
+    area.innerHTML = `
+      <div class="notice ${kind}">
+        <span aria-hidden="true">
+          ${
+            kind === 'success'
+              ? '✓'
+              : '!'
+          }
+        </span>
+
+        <span>
+          ${escapeHTML(
+            message
+          )}
+        </span>
+      </div>
+    `;
+
+    clearTimeout(
+      adminToastTimer
+    );
+
+    adminToastTimer =
+      setTimeout(
+        () => {
+          area.innerHTML = '';
+        },
+        3200
+      );
+  }
+
+  function firebaseErrorText(
+    error
+  ) {
+    const code =
+      error?.code || '';
+
+    if (
+      code.includes(
+        'auth/invalid-credential'
+      ) ||
+      code.includes(
+        'auth/wrong-password'
+      ) ||
+      code.includes(
+        'auth/user-not-found'
+      )
+    ) {
+      return 'メールアドレスまたはパスワードが正しくありません。';
+    }
+
+    if (
+      code.includes(
+        'auth/invalid-email'
+      )
+    ) {
+      return 'メールアドレスの形式を確認してください。';
+    }
+
+    if (
+      code.includes(
+        'permission-denied'
+      )
+    ) {
+      return 'Firebaseの権限設定を確認してください。';
+    }
+
+    if (
+      code.includes(
+        'already-exists'
+      )
+    ) {
+      return 'このブラウザではすでに投票済みです。';
+    }
+
+    if (
+      code.includes(
+        'unavailable'
+      ) ||
+      code.includes(
+        'network'
+      )
+    ) {
+      return 'Firebaseに接続できません。通信環境を確認してください。';
+    }
+
+    return (
+      error?.message ||
+      'Firebaseとの通信に失敗しました。'
+    );
+  }
+
+  function racePayload(
+    nextState
+  ) {
+    const normalized =
+      normalizeState(
+        nextState
+      );
+
+    return {
+      title:
+        normalized.title,
+
+      status:
+        normalized.status,
+
+      revealed:
+        normalized.revealed,
+
+      winnerId:
+        normalized.winnerId,
+
+      horses:
+        normalized.horses,
+
+      updatedAt:
+        window.firebase
+          .firestore
+          .FieldValue
+          .serverTimestamp(),
+    };
+  }
+
+  async function saveRaceSettings(
+    nextState,
+    message = ''
+  ) {
+    const normalized =
+      normalizeState({
+        ...nextState,
+        updatedAt: Date.now(),
+      });
+
+    if (
+      remoteActive() &&
+      remote.admin
+    ) {
+      state =
+        normalized;
+
+      syncLocalSnapshot(
+        state
+      );
+
+      try {
+        await remote.raceRef.set(
+          racePayload(
+            normalized
+          ),
+          {
+            merge: true,
+          }
+        );
+
+        if (message) {
+          showToast(
+            message
+          );
+        }
+      } catch (error) {
+        remote.error =
+          firebaseErrorText(
+            error
+          );
+
+        renderAll();
+
+        showAdminToast(
+          remote.error,
+          'warning'
+        );
+      }
+
+      return;
+    }
+
+    if (
+      remote.configured &&
+      !remote.fallback
+    ) {
+      showAdminToast(
+        'Firebase管理者としてログインしてください',
+        'warning'
+      );
+
+      return;
+    }
+
+    showAdminToast(
+      'Firebaseに接続できないため、設定を変更できません。',
+      'warning'
+    );
+  }
+
+  async function handleVote(
+    event
+  ) {
+    event.preventDefault();
+
+    // 公開版ではFirebase必須
+    if (
+      !remote.configured ||
+      remote.fallback
+    ) {
+      showToast(
+        '現在サーバーに接続できないため、投票できません'
+      );
+      return;
+    }
+
+    if (!remoteActive()) {
+      showToast(
+        'Firebaseに接続中です。少し待ってから再度お試しください'
+      );
+      return;
+    }
+
+    if (
+      state.status !== 'open'
+    ) {
+      showToast(
+        '現在は投票を受け付けていません'
+      );
+      return;
+    }
+
+    const key =
+      currentVoterKey();
+
+    if (
+      state.votes[key]
+    ) {
+      showToast(
+        'このブラウザでは投票済みです'
+      );
+      return;
+    }
+
+    const selected =
+      $('input[name="horse"]:checked');
+
+    if (!selected) {
+      showToast(
+        '1位になると思う候補を選んでください'
+      );
+
+      $('.selection-card')
+        .animate?.(
+          [
+            {
+              transform:
+                'translateX(-4px)',
+            },
+            {
+              transform:
+                'translateX(4px)',
+            },
+            {
+              transform:
+                'none',
+            },
+          ],
+          {
+            duration: 220,
+          }
+        );
+
+      return;
+    }
+
+    try {
+      await remote.votesRef
+        .doc(
+          remote.user.uid
+        )
+        .create({
+          horseId:
+            selected.value,
+
+          createdAt:
+            window.firebase
+              .firestore
+              .FieldValue
+              .serverTimestamp(),
+        });
+
+      syncLocalSnapshot({
+        ...state,
+
+        votes: {
+          ...state.votes,
+
+          [remote.user.uid]:
+            selected.value,
+        },
+
+        updatedAt:
+          Date.now(),
+      });
+
+      showToast(
+        '投票を受け付けました！'
+      );
+
+    } catch (error) {
+      showToast(
+        firebaseErrorText(
+          error
+        )
+      );
+    }
+  }
+
+  async function checkAdminAccess(
+    user
+  ) {
+    if (
+      !user ||
+      user.isAnonymous ||
+      !remote.db
+    ) {
+      return false;
+    }
+
+    try {
+      const adminDoc =
+        await remote.db
+          .collection(
+            'admins'
+          )
+          .doc(
+            user.uid
+          )
+          .get();
+
+      return (
+        adminDoc.exists &&
+        adminDoc.data()
+          ?.enabled !== false
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function handleLogin(
+    event
+  ) {
+    event.preventDefault();
+
+    const email =
+      $('#admin-email')
+        .value
+        .trim();
+
+    const password =
+      $('#admin-password')
+        .value;
+
+    const error =
+      $('#login-error');
+
+    error.textContent = '';
+
+    if (
+      !remote.configured ||
+      remote.fallback
+    ) {
+      error.textContent =
+        'Firebaseに接続できないため、管理者ログインを利用できません。';
+
+      return;
+    }
+
+    if (!remote.auth) {
+      error.textContent =
+        'Firebaseを初期化できていません。設定を確認してください。';
+
+      return;
+    }
+
+    try {
+      const credential =
+        await remote.auth
+          .signInWithEmailAndPassword(
+            email,
+            password
+          );
+
+      const allowed =
+        await checkAdminAccess(
+          credential.user
+        );
+
+      if (!allowed) {
+        await remote.auth.signOut();
+
+        throw new Error(
+          '管理者UIDが未登録です。Firebaseのadminsコレクションを確認してください。'
+        );
+      }
+
+      remote.admin = true;
+      remote.error = '';
+
+      $('#login-form')
+        .reset();
+
+      await ensureRemoteRace();
+
+      renderAll();
+
+      showAdminToast(
+        '管理者としてログインしました'
+      );
+
+    } catch (authError) {
+      error.textContent =
+        authError.message?.startsWith(
+          '管理者UID'
+        )
+          ? authError.message
+          : firebaseErrorText(
+              authError
+            );
+
+      remote.admin = false;
+
+      renderAll();
+    }
+  }
+
+  async function moveHorse(
+    horseId,
+    direction
+  ) {
+    const index =
+      state.horses.findIndex(
+        (horse) =>
+          horse.id ===
+          horseId
+      );
+
+    const target =
+      direction === 'up'
+        ? index - 1
+        : index + 1;
+
+    if (
+      index < 0 ||
+      target < 0 ||
+      target >=
+        state.horses.length
+    ) {
+      return;
+    }
+
+    const horses =
+      [...state.horses];
+
+    [
+      horses[index],
+      horses[target],
+    ] = [
+      horses[target],
+      horses[index],
+    ];
+
+    await saveRaceSettings(
+      {
+        ...state,
+        horses,
+      },
+      '表示順を保存しました'
+    );
+
+    showAdminToast(
+      '表示順を保存しました'
+    );
+  }
+
+  async function resetRemoteVotes() {
+    const snapshot =
+      await remote.votesRef.get();
+
+    let batch =
+      remote.db.batch();
+
+    let operationCount = 0;
+
+    const commits = [];
+
+    snapshot.forEach(
+      (voteDoc) => {
+        batch.delete(
+          voteDoc.ref
+        );
+
+        operationCount += 1;
+
+        if (
+          operationCount ===
+          450
+        ) {
+          commits.push(
+            batch.commit()
+          );
+
+          batch =
+            remote.db.batch();
+
+          operationCount = 0;
+        }
+      }
+    );
+
+    if (
+      operationCount > 0
+    ) {
+      commits.push(
+        batch.commit()
+      );
+    }
+
+    await Promise.all(
+      commits
+    );
+  }
+
+  async function ensureRemoteRace() {
+    if (
+      !remoteActive() ||
+      !remote.admin
+    ) {
+      return;
+    }
+
+    const snapshot =
+      await remote.raceRef.get();
+
+    if (!snapshot.exists) {
+      await remote.raceRef.set(
+        racePayload(
+          state
+        )
+      );
+    }
+  }
+
+  async function logout() {
+    if (
+      remote.configured &&
+      !remote.fallback &&
+      remote.auth
+    ) {
+      remote.admin = false;
+
+      await remote.auth.signOut();
+
+      showToast(
+        'ログアウトしました'
+      );
+
+      return;
+    }
+
+    showToast(
+      'ログアウトしました'
+    );
+  }
+
+  async function subscribeRemote() {
+    if (!remoteActive()) {
+      return;
+    }
+
+    remote.stopRace?.();
+    remote.stopVotes?.();
+
+    remote.stopRace =
+      remote.raceRef.onSnapshot(
+        (snapshot) => {
+          if (
+            !snapshot.exists
+          ) {
+            if (
+              remote.admin
+            ) {
+              void ensureRemoteRace();
+            }
+
+            return;
+          }
+
+          remote.error = '';
+
+          syncLocalSnapshot({
+            ...state,
+            ...snapshot.data(),
+            votes:
+              state.votes,
+          });
+        },
+        (error) => {
+          remote.error =
+            firebaseErrorText(
+              error
+            );
+
+          renderAll();
+        }
+      );
+
+    remote.stopVotes =
+      remote.votesRef.onSnapshot(
+        (snapshot) => {
+          const votes = {};
+
+          snapshot.forEach(
+            (voteDoc) => {
+              const horseId =
+                voteDoc.data()
+                  ?.horseId;
+
+              if (horseId) {
+                votes[
+                  voteDoc.id
+                ] = horseId;
+              }
+            }
+          );
+
+          syncLocalSnapshot({
+            ...state,
+            votes,
+          });
+        },
+        (error) => {
+          remote.error =
+            firebaseErrorText(
+              error
+            );
+
+          renderAll();
+        }
+      );
+  }
+
+  async function initializeFirebase() {
+    if (
+      !remote.configured
+    ) {
+      remote.fallback = true;
+
+      remote.error =
+        'Firebaseが設定されていないため、現在投票を受け付けていません。';
+
+      renderAll();
+
+      return;
+    }
+
+    try {
+      if (
+        !window.firebase.apps.length
+      ) {
+        window.firebase.initializeApp(
+          window.FIREBASE_CONFIG
+        );
+      }
+
+      remote.auth =
+        window.firebase.auth();
+
+      remote.db =
+        window.firebase.firestore();
+
+      remote.raceRef =
+        remote.db
+          .collection('races')
+          .doc(
+            REMOTE_RACE_ID
+          );
+
+      remote.votesRef =
+        remote.raceRef
+          .collection(
+            'votes'
+          );
+
+      remote.auth.onAuthStateChanged(
+        async (user) => {
+          remote.user =
+            user;
+
+          remote.authReady =
+            true;
+
+          remote.admin =
+            user
+              ? await checkAdminAccess(
+                  user
+                )
+              : false;
+
+          await subscribeRemote();
+
+          renderAll();
+
+          /*
+           * 一般参加者は匿名Firebase
+           * アカウントで参加します。
+           */
+          if (
+            !user &&
+            !remote.signingIn
+          ) {
+            remote.signingIn =
+              true;
+
+            try {
+              await remote.auth
+                .signInAnonymously();
+            } catch (error) {
+              remote.fallback =
+                true;
+
+              remote.error =
+                'サーバーに接続できないため、現在投票を受け付けていません。';
+
+              renderAll();
+            } finally {
+              remote.signingIn =
+                false;
+            }
+          }
+        }
+      );
+
+    } catch (error) {
+      remote.fallback =
+        true;
+
+      remote.error =
+        'サーバーに接続できないため、現在投票を受け付けていません。';
+
+      renderAll();
+    }
+  }
+
+  function bindEvents() {
+    document.addEventListener(
+      'click',
+      (event) => {
+        const nav =
+          event.target.closest(
+            '[data-nav]'
+          );
+
+        if (nav) {
+          event.preventDefault();
+
+          navigate(
+            nav.dataset.nav
+          );
+
+          return;
+        }
+
+        const action =
+          event.target
+            .closest(
+              '[data-action]'
+            )
+            ?.dataset.action;
+
+        if (
+          action === 'logout'
+        ) {
+          void logout();
+          return;
+        }
+
+        if (
+          action ===
+          'toggle-theme'
+        ) {
+          const dark =
+            !document.body.classList.contains(
+              'dark-mode'
+            );
+
+          document.body.classList.toggle(
+            'dark-mode',
+            dark
+          );
+
+          safeStorageSet(
+            THEME_KEY,
+            dark
+              ? 'dark'
+              : 'light'
+          );
+
+          return;
+        }
+
+        const moveButton =
+          event.target.closest(
+            '[data-move]'
+          );
+
+        if (moveButton) {
+          void moveHorse(
+            moveButton.dataset
+              .horseId,
+            moveButton.dataset
+              .move
+          );
+        }
+      }
+    );
+
+    $('#vote-form')
+      ?.addEventListener(
+        'submit',
+        (event) => {
+          void handleVote(
+            event
+          );
+        }
+      );
+
+    $('#login-form')
+      ?.addEventListener(
+        'submit',
+        (event) => {
+          void handleLogin(
+            event
+          );
+        }
+      );
+
+    $('#setting-title')
+      ?.addEventListener(
+        'change',
+        (event) => {
+          const title =
+            event.target.value
+              .trim() ||
+            '文化祭記念・人気投票';
+
+          void saveRaceSettings(
+            {
+              ...state,
+              title,
+            },
+            'レース名を保存しました'
+          );
+
+          showAdminToast(
+            'レース名を保存しました'
+          );
+        }
+      );
+
+    $('#toggle-open-button')
+      ?.addEventListener(
+        'click',
+        () => {
+          if (
+            state.status ===
+            'revealed'
+          ) {
+            showAdminToast(
+              '結果発表後は、いったん結果発表を取り消してください',
+              'warning'
+            );
+
+            return;
+          }
+
+          const nextStatus =
+            state.status ===
+            'open'
+              ? 'closed'
+              : 'open';
+
+          void saveRaceSettings(
+            {
+              ...state,
+              status:
+                nextStatus,
+            },
+            nextStatus ===
+              'open'
+              ? '投票受付を開始しました'
+              : '投票受付を終了しました'
+          );
+
+          showAdminToast(
+            nextStatus ===
+              'open'
+              ? '投票受付を開始しました'
+              : '投票受付を終了しました'
+          );
+        }
+      );
+
+    $('#admin-horse-list')
+      ?.addEventListener(
+        'change',
+        (event) => {
+          const input =
+            event.target.closest(
+              '[data-horse-name]'
+            );
+
+          if (!input) return;
+
+          const horses =
+            state.horses.map(
+              (horse) =>
+                horse.id ===
+                input.dataset
+                  .horseName
+                  ? {
+                      ...horse,
+                      name:
+                        input.value
+                          .trim() ||
+                        horse.name,
+                    }
+                  : horse
+            );
+
+          void saveRaceSettings(
+            {
+              ...state,
+              horses,
+            },
+            '名前を保存しました'
+          );
+
+          showAdminToast(
+            '名前を保存しました'
+          );
+        }
+      );
+
+    $('#winner-select')
+      ?.addEventListener(
+        'change',
+        (event) => {
+          void saveRaceSettings(
+            {
+              ...state,
+              winnerId:
+                event.target
+                  .value,
+            },
+            '1位の候補を選択しました'
+          );
+
+          showAdminToast(
+            '1位の候補を選択しました'
+          );
+        }
+      );
+
+    $('#announce-button')
+      ?.addEventListener(
+        'click',
+        () => {
+          const winnerId =
+            $('#winner-select')
+              .value;
+
+          if (!winnerId) {
+            showAdminToast(
+              '1位の候補を選んでください',
+              'warning'
+            );
+
+            return;
+          }
+
+          if (
+            !window.confirm(
+              'この候補を1位として結果発表しますか？'
+            )
+          ) {
+            return;
+          }
+
+          void saveRaceSettings(
+            {
+              ...state,
+              winnerId,
+              revealed:
+                true,
+              status:
+                'revealed',
+            },
+            '結果を発表しました'
+          );
+
+          showAdminToast(
+            '結果を発表しました'
+          );
+        }
+      );
+
+    $('#clear-result-button')
+      ?.addEventListener(
+        'click',
+        () => {
+          if (
+            !state.revealed &&
+            !state.winnerId
+          ) {
+            return;
+          }
+
+          if (
+            !window.confirm(
+              '結果発表を取り消して、投票受付中に戻しますか？'
+            )
+          ) {
+            return;
+          }
+
+          void saveRaceSettings(
+            {
+              ...state,
+              winnerId:
+                null,
+              revealed:
+                false,
+              status:
+                'open',
+            },
+            '結果発表を取り消しました'
+          );
+
+          showAdminToast(
+            '結果発表を取り消しました'
+          );
+        }
+      );
+
+    $('#reset-votes-button')
+      ?.addEventListener(
+        'click',
+        () => {
+          if (
+            !window.confirm(
+              '現在の投票をすべて消去します。次のレースを始めますか？'
+            )
+          ) {
+            return;
+          }
+
+          if (
+            remoteActive() &&
+            remote.admin
+          ) {
+            void (async () => {
+              try {
+                await resetRemoteVotes();
+
+                await saveRaceSettings(
+                  {
+                    ...state,
+                    votes: {},
+                    winnerId:
+                      null,
+                    revealed:
+                      false,
+                    status:
+                      'open',
+                  },
+                  '投票データをリセットしました'
+                );
+
+                showAdminToast(
+                  '次の投票を開始しました'
+                );
+
+              } catch (error) {
+                showAdminToast(
+                  firebaseErrorText(
+                    error
+                  ),
+                  'warning'
+                );
+              }
+            })();
+          } else {
+            showAdminToast(
+              'Firebase管理者としてログインしてください',
+              'warning'
+            );
+          }
+        }
+      );
+
+    window.addEventListener(
+      'storage',
+      (event) => {
+        if (
+          event.key ===
+            STORAGE_KEY &&
+          event.newValue
+        ) {
+          try {
+            state =
+              normalizeState(
+                JSON.parse(
+                  event.newValue
+                )
+              );
+
+            renderAll();
+
+            showToast(
+              '最新の状況に更新しました'
+            );
+          } catch (_) {
+            // ignore
+          }
+        }
+      }
+    );
+
+    if (
+      'BroadcastChannel' in
+      window
+    ) {
+      try {
+        broadcast =
+          new BroadcastChannel(
+            STORAGE_KEY
+          );
+
+        broadcast.addEventListener(
+          'message',
+          (event) => {
+            if (
+              event.data
+                ?.type !==
+              'state-updated'
+            ) {
+              return;
+            }
+
+            state =
+              normalizeState(
+                event.data.state
+              );
+
+            renderAll();
+          }
+        );
+      } catch (_) {
+        // optional
+      }
+    }
+
+    window.addEventListener(
+      'hashchange',
+      () =>
+        navigate(
+          window.location.hash.slice(
+            1
+          ),
+          false
+        )
+    );
+  }
+
+  function init() {
+    if (
+      safeStorageGet(
+        THEME_KEY
+      ) === 'dark'
+    ) {
+      document.body.classList.add(
+        'dark-mode'
+      );
+    }
+
+    bindEvents();
+
+    renderAll();
+
+    navigate(
+      window.location.hash.slice(
+        1
+      ) || 'vote',
+      false
+    );
+
+    void initializeFirebase();
+  }
+
+  init();
+})();
